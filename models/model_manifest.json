@@ -1,0 +1,23 @@
+{
+  "macrophytes": {
+    "file": "models/macrofitas/model_best_unet2_s1_S1.pt",
+    "sensor": "Sentinel-1",
+    "architecture": "U-Net ResNet34",
+    "bands": ["VV", "VH"],
+    "classes": {"0": "background", "1": "water", "2": "plant"},
+    "patch_size": 128,
+    "stride": 64
+  },
+  "water_quality": {
+    "sensor": "Sentinel-2 L2A",
+    "bands": ["B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A"],
+    "reflectance_scale": 0.0001,
+    "feature_count": 32,
+    "models": {
+      "chlorophyll_a": "models/water_quality/modelo_pred_Senti_chl_a.pkl",
+      "turbidity_ntu": "models/water_quality/modelo_pred_Senti_turb_ntu.pkl",
+      "secchi_cm": "models/water_quality/modelo_pred_Senti_secchi_cm.pkl",
+      "pc_rfu": "models/water_quality/modelo_pred_Senti_pc_rfu.pkl"
+    }
+  }
+}

@@ -1,0 +1,435 @@
+# -*- coding: utf-8 -*-
+"""
+SÉRIE TEMPORAL — Sentinel-1 VV/VH — Inferência (YEARS)
+- Inferência no raster inteiro (sliding window + blending)
+- Dentro da AOI: probabilidade da classe 0 (BG) é zerada => argmax ∈ {water(1), plant(2)}
+- Métrica calculada apenas dentro da AOI (pixels e área de plantas)
+- Detecção de anomalias (maiores variações entre cenas consecutivas)
+- Salva CSV e plota série temporal com anotações
+"""
+
+import os, re, time
+from pathlib import Path
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import rasterio
+from rasterio.features import rasterize
+from rasterio.transform import Affine
+import geopandas as gpd
+from shapely.ops import unary_union
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter
+
+# =========================
+# CONFIG
+# =========================
+# Pastas com os TIFs originais (um diretório por ano)
+BASE_DIRS = [
+    r"D:\0 SR REGAP\Tese_Cap2_2025\S1_GRD\2015",
+    r"D:\0 SR REGAP\Tese_Cap2_2025\S1_GRD\2016",
+    r"D:\0 SR REGAP\Tese_Cap2_2025\S1_GRD\2017",
+    r"D:\0 SR REGAP\Tese_Cap2_2025\S1_GRD\2018",
+    r"D:\0 SR REGAP\Tese_Cap2_2025\S1_GRD\2019",
+    r"D:\0 SR REGAP\Tese_Cap2_2025\S1_GRD\2020",
+    r"D:\0 SR REGAP\Tese_Cap2_2025\S1_GRD\2021",
+    r"D:\0 SR REGAP\Tese_Cap2_2025\S1_GRD\2022",
+    r"D:\0 SR REGAP\Tese_Cap2_2025\S1_GRD\2023",
+    r"D:\0 SR REGAP\Tese_Cap2_2025\S1_GRD\2024",
+    r"D:\0 SR REGAP\Tese_Cap2_2025\S1_GRD\2025", r"D:\0 SR REGAP\Tese_Cap2_2025\S1_GRD\2026"
+]
+# Intervalo de anos que deseja analisar (entra também no nome dos arquivos de saída)
+YEARS = (2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026)
+
+# AOI (o raster inteiro é inferido, mas métricas e máscara bg-free valem só dentro da AOI)
+AOI_PATH = r"D:\0 SR REGAP\shapefiles\lagoa_regap_vetorizado2025.shp"
+
+# Modelo
+model_name = "unet2_s1"  # 'unet2_s1' | 'deeplabv3+2_s1' | 'swin2_s1'
+model_ckpt = f"checkpoints_s1/model_best_{model_name}_S1.pt"
+
+# Hiperparâmetros de inferência
+patch_size   = 128
+stride       = 64
+batch_size   = 8
+in_channels  = 2   # VV,VH
+num_classes  = 3   # 0=bg, 1=water, 2=plant
+use_amp      = False
+
+# Saídas (nomes gerados a partir de YEARS)
+OUT_DIR  = r"D:\0 SR REGAP\Tese_Cap2_2025\series_s1_temporal"
+os.makedirs(OUT_DIR, exist_ok=True)
+years_str = f"{min(YEARS)}_{max(YEARS)}"
+CSV_OUT = os.path.join(OUT_DIR, f"serie_plantas_{years_str}.csv")
+FIG_OUT = os.path.join(OUT_DIR, f"serie_plantas_{years_str}.png")
+
+# Device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Regex para datas no nome do arquivo (S1_YYYYMMDD...)
+RE_DATE = re.compile(r"(\d{8})")
+
+# =========================
+# BUILDERS (iguais ao treino S1)
+# =========================
+def build_model(model_name: str, in_channels=2, num_classes=3):
+    name = model_name.lower()
+    if name == "unet2_s1":
+        import segmentation_models_pytorch as smp
+        return smp.Unet(
+            encoder_name="resnet34",
+            encoder_weights=None,
+            in_channels=in_channels,
+            classes=num_classes
+        )
+    elif name == "deeplabv3+2_s1":
+        import segmentation_models_pytorch as smp
+        return smp.DeepLabV3Plus(
+            encoder_name="resnet50",
+            encoder_weights=None,
+            in_channels=in_channels,
+            classes=num_classes
+        )
+    elif name == "swin2_s1":
+        import timm
+        backbone = timm.create_model(
+            "swin_tiny_patch4_window7_224",
+            features_only=True,
+            out_indices=(0, 1, 2, 3),
+            in_chans=in_channels,
+            pretrained=False,
+            img_size=patch_size,
+            window_size=8
+        )
+        feat_channels = backbone.feature_info.channels()
+
+        class FPNDecoder(nn.Module):
+            def __init__(self, in_chs, out_ch=128, num_classes=3):
+                super().__init__()
+                C1, C2, C3, C4 = in_chs
+                self.l4 = nn.Conv2d(C4, out_ch, 1)
+                self.l3 = nn.Conv2d(C3, out_ch, 1)
+                self.l2 = nn.Conv2d(C2, out_ch, 1)
+                self.l1 = nn.Conv2d(C1, out_ch, 1)
+                self.s4 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+                self.s3 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+                self.s2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+                self.s1 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+                self.cls = nn.Conv2d(out_ch, num_classes, 3, padding=1)
+            def forward(self, feats, target_size):
+                c1, c2, c3, c4 = feats
+                p4 = self.l4(c4)
+                p3 = self.l3(c3) + F.interpolate(p4, size=c3.shape[-2:], mode="bilinear", align_corners=False)
+                p2 = self.l2(c2) + F.interpolate(p3, size=c2.shape[-2:], mode="bilinear", align_corners=False)
+                p1 = self.l1(c1) + F.interpolate(p2, size=c1.shape[-2:], mode="bilinear", align_corners=False)
+                p4 = self.s4(p4); p3 = self.s3(p3); p2 = self.s2(p2); p1 = self.s1(p1)
+                logits = self.cls(p1)
+                return F.interpolate(logits, size=target_size, mode="bilinear", align_corners=False)
+
+        class TimmBackboneFPN(nn.Module):
+            def __init__(self, bb, in_chs, num_classes):
+                super().__init__()
+                self.backbone = bb
+                self.in_chs = in_chs
+                self.decoder = FPNDecoder(in_chs, out_ch=128, num_classes=num_classes)
+            def _to_nchw(self, f, c_expected):
+                if f.ndim == 4 and f.shape[1] != c_expected and f.shape[-1] == c_expected:
+                    f = f.permute(0, 3, 1, 2).contiguous()
+                return f
+            def forward(self, x):
+                feats = self.backbone(x)
+                feats = [self._to_nchw(f, c) for f, c in zip(feats, self.in_chs)]
+                return self.decoder(feats, target_size=x.shape[-2:])
+        return TimmBackboneFPN(backbone, feat_channels, num_classes)
+    else:
+        raise ValueError("Escolha: 'unet2_s1', 'deeplabv3+2_s1' ou 'swin2_s1'.")
+
+# =========================
+# SLIDING WINDOW / BLENDING
+# =========================
+def hann2d(h, w):
+    wy = np.hanning(h); wx = np.hanning(w)
+    w2d = np.outer(wy, wx).astype(np.float32)
+    return w2d / (w2d.max() + 1e-8)
+
+WEIGHT_2D = hann2d(patch_size, patch_size)[None, ...]
+
+def compute_pad(H, W, size, stride):
+    pad_h = (-(H - size) % stride) % stride
+    pad_w = (-(W - size) % stride) % stride
+    return pad_h, pad_w
+
+def sliding_window_batch_reflect(arr, size, stride, batch_size):
+    """
+    Varredura sobre a imagem inteira com padding por reflexão.
+    Não filtramos por AOI (inferência é global).
+    """
+    C, H, W = arr.shape
+    pad_h, pad_w = compute_pad(H, W, size, stride)
+    arr_pad = np.pad(arr, ((0,0),(0,pad_h),(0,pad_w)), mode='reflect')
+    H2, W2 = arr_pad.shape[1], arr_pad.shape[2]
+    patches, coords = [], []
+    for i in range(0, H2 - size + 1, stride):
+        for j in range(0, W2 - size + 1, stride):
+            patches.append(arr_pad[:, i:i+size, j:j+size])
+            coords.append((i, j))  # coords no espaço com padding
+            if len(patches) == batch_size:
+                yield np.stack(patches), coords
+                patches, coords = [], []
+    if patches:
+        yield np.stack(patches), coords
+
+# =========================
+# AOI helpers
+# =========================
+def load_aoi(src):
+    """Lê AOI, reprojeta para o CRS do raster e rasteriza para uma máscara booleana do tamanho da imagem."""
+    gdf = gpd.read_file(AOI_PATH)
+    if gdf.crs != src.crs:
+        gdf = gdf.to_crs(src.crs)
+    try:
+        aoi_union = unary_union(list(gdf.geometry))
+    except Exception:
+        aoi_union = gdf.unary_union
+    aoi_mask = rasterize(
+        [(aoi_union, 1)],
+        out_shape=(src.height, src.width),
+        transform=src.transform,
+        fill=0,
+        dtype=np.uint8
+    ).astype(bool)
+    return aoi_mask
+
+# =========================
+# INFERÊNCIA (classe 0 suprimida apenas DENTRO da AOI)
+# =========================
+@torch.no_grad()
+def infer_scene(tif_path, model):
+    with rasterio.open(tif_path) as src:
+        img = src.read().astype(np.float32)  # [C,H,W]
+        transform = src.transform
+        crs = src.crs
+        aoi_mask = load_aoi(src)
+        px_area = abs(transform.a * transform.e)  # m²/pixel (UTM)
+
+    # Garante [VV,VH]
+    C, H, W = img.shape
+    if C < in_channels:
+        img = np.concatenate([img, np.zeros((in_channels - C, H, W), img.dtype)], axis=0)
+    elif C > in_channels:
+        img = img[:in_channels]
+
+    # Acumuladores (blending)
+    pred_sum   = np.zeros((num_classes, H, W), dtype=np.float32)
+    weight_sum = np.zeros((H, W), dtype=np.float32)
+
+    pad_h, pad_w = compute_pad(H, W, patch_size, stride)
+    total_tiles = ((H + pad_h - patch_size) // stride + 1) * ((W + pad_w - patch_size) // stride + 1)
+
+    pbar = tqdm(desc=f"Inferindo {Path(tif_path).name}", total=total_tiles, unit="tile")
+    for batch, coords in sliding_window_batch_reflect(img, patch_size, stride, batch_size):
+        x = torch.from_numpy(batch).to(device)
+        with torch.cuda.amp.autocast(enabled=(use_amp and device.type=='cuda')):
+            logits = model(x)
+            probs = F.softmax(logits, dim=1).float().cpu().numpy()  # [B,C,H,W]
+
+        probs *= WEIGHT_2D  # janela de Hann
+        for k, (i, j) in enumerate(coords):
+            i0, j0 = min(i, H-1), min(j, W-1)
+            i1, j1 = min(i0 + patch_size, H), min(j0 + patch_size, W)
+            h, w = i1 - i0, j1 - j0
+
+            # Suprime BG (classe 0) APENAS dentro da AOI deste sub-bloco
+            sub_aoi = aoi_mask[i0:i1, j0:j1]
+            probs[k, 0, :h, :w][sub_aoi] = 0.0
+
+            pred_sum[:, i0:i1, j0:j1] += probs[k, :, :h, :w]
+            weight_sum[i0:i1, j0:j1]  += WEIGHT_2D[0, :h, :w]
+        pbar.update(len(coords))
+    pbar.close()
+
+    # Média ponderada + argmax
+    avg_probs = pred_sum / np.maximum(weight_sum, 1e-6)
+    pred = np.argmax(avg_probs, axis=0).astype(np.uint8)
+
+    # Métricas APENAS na AOI
+    aoi_pixels   = int(aoi_mask.sum())
+    plant_pixels = int((pred == 2)[aoi_mask].sum())
+    plant_pct    = (plant_pixels / max(1, aoi_pixels)) * 100.0
+    plant_area_m2 = plant_pixels * px_area
+
+    return {
+        "pred": pred,                 # para debug (não salvamos aqui)
+        "aoi_pixels": aoi_pixels,
+        "plant_pixels": plant_pixels,
+        "plant_pct": plant_pct,
+        "plant_area_m2": plant_area_m2,
+        "transform": transform,
+        "crs": crs,
+        "aoi_mask": aoi_mask
+    }
+
+# =========================
+# LISTAGEM: somente TIFs brutos (ignora derivados/classificados)
+# =========================
+DERIVED_HINTS = (
+    "mask", "labels", "pred", "inference", "aoi", "labels_by_patch"
+)
+
+def is_raw_s1_tif(fname: str) -> bool:
+    """
+    Retorna True se for um TIF 'bruto' de S1 com 'VV' e 'VH' no nome,
+    e False se aparenta ser um produto derivado (classificação/saída).
+    Exemplos a ignorar:
+        *_mask_unet2_s1_AOI.tif
+        *_labels_by_patch.gpkg (aqui nem .tif, mas deixado por segurança)
+        *_pred.tif, *_inference.tif, *_AOI.tif
+    """
+    name = fname.lower()
+    if not name.endswith(".tif"):
+        return False
+    # precisa ter vv e vh no nome
+    if ("vv" not in name) or ("vh" not in name):
+        return False
+    # remove qualquer coisa que pareça derivado
+    if any(h in name for h in DERIVED_HINTS):
+        return False
+    return True
+
+def list_tifs_in_years(base_dirs, years):
+    paths = []
+    for base in base_dirs:
+        if not os.path.isdir(base):
+            continue
+        for f in os.listdir(base):
+            if not is_raw_s1_tif(f):
+                continue
+            m = RE_DATE.search(f)
+            if not m:
+                continue
+            y = int(m.group(1)[:4])
+            if y in years:
+                paths.append(os.path.join(base, f))
+    # ordena por data (YYYYMMDD) e nome
+    def key_date(p):
+        m = RE_DATE.search(os.path.basename(p))
+        d = m.group(1) if m else "19000101"
+        return d, os.path.basename(p)
+    paths.sort(key=key_date)
+    return paths
+
+# =========================
+# PLOT da série + anomalias
+# =========================
+def plot_series(df, out_png, top_k=5, years_tuple=(2018, 2020)):
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+
+    fig, ax = plt.subplots(figsize=(11,5))
+
+    ax.plot(
+        df["date"].to_numpy(),
+        df["plant_pct"].to_numpy(),
+        marker="o",
+        linewidth=1.6
+    )
+
+    # Top-K variações absolutas (entre cenas consecutivas)
+    dd = df.dropna(subset=["diff_pct"]).copy()
+    dd = dd.reindex(dd["abs_diff_pct"].sort_values(ascending=False).index)
+    top = dd.head(min(top_k, len(dd)))
+
+    ax.scatter(
+        top["date"].to_numpy(),
+        top["plant_pct"].to_numpy(),
+        s=80,
+        zorder=3
+    )
+
+    for _, r in top.iterrows():
+        ax.annotate(
+            f"{r['date'].date()}  Δ={r['diff_pct']:+.1f} pp",
+            xy=(r["date"], r["plant_pct"]),
+            xytext=(10, 12),
+            textcoords="offset points",
+            fontsize=9,
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.9),
+            arrowprops=dict(arrowstyle="->", lw=0.8)
+        )
+
+    ax.set_title(f"Cobertura de plantas na AOI — série temporal ({min(years_tuple)}–{max(years_tuple)})")
+    ax.set_ylabel("Plant % na AOI")
+    ax.set_xlabel("Data")
+    ax.grid(True, alpha=0.3)
+    ax.xaxis.set_major_formatter(DateFormatter("%Y-%m-%d"))
+    fig.autofmt_xdate(rotation=45)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.show()
+# =========================
+# MAIN
+# =========================
+def main():
+    t0 = time.perf_counter()
+
+    # Carrega modelo
+    model = build_model(model_name, in_channels=in_channels, num_classes=num_classes).to(device)
+    sd = torch.load(model_ckpt, map_location=device)
+    model.load_state_dict(sd)
+    model.eval()
+
+    # Lista a série (filtra somente TIFs brutos e anos desejados)
+    tif_list = list_tifs_in_years(BASE_DIRS, YEARS)
+    assert tif_list, "Nenhum TIF bruto encontrado nas pastas/anos informados."
+
+    # Roda a inferência cena a cena e mede PLANTAS na AOI
+    rows = []
+    for tif_path in tif_list:
+        base = os.path.basename(tif_path)
+        m = RE_DATE.search(base)
+        dstr = m.group(1) if m else "19000101"
+        d = datetime.strptime(dstr, "%Y%m%d")
+
+        out = infer_scene(tif_path, model)
+        rows.append({
+            "date": d,
+            "file": base,
+            "aoi_pixels": out["aoi_pixels"],
+            "plant_pixels": out["plant_pixels"],
+            "plant_pct": out["plant_pct"],
+            "plant_area_m2": out["plant_area_m2"]
+        })
+
+    # Série temporal
+    df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+
+    # Diferenças entre cenas consecutivas
+    df["diff_pct"]      = df["plant_pct"].diff()
+    df["diff_area_m2"]  = df["plant_area_m2"].diff()
+    df["abs_diff_pct"]  = df["diff_pct"].abs()
+    df["abs_diff_area"] = df["diff_area_m2"].abs()
+
+    # Salva CSV
+    df.to_csv(CSV_OUT, index=False)
+    print(f"✓ Série salva em: {CSV_OUT}")
+
+    # Relatório simples de anomalias (Top 10 por |Δ Plant %|)
+    dd = df.dropna(subset=["diff_pct"]).copy()
+    dd = dd.reindex(dd["abs_diff_pct"].sort_values(ascending=False).index)
+    print("\nTop variações (Δ Plant % entre cenas consecutivas):")
+    for _, r in dd.head(10).iterrows():
+        print(f"- {r['date'].date()}: Δ={r['diff_pct']:+.2f} pp | Plant%={r['plant_pct']:.2f}")
+
+    # Plot da série com anotações
+    plot_series(df, FIG_OUT, top_k=5, years_tuple=YEARS)
+    print(f"✓ Figura salva em: {FIG_OUT}")
+
+    print(f"\n⏱ Tempo total: {(time.perf_counter()-t0):.1f}s")
+
+if __name__ == "__main__":
+    main()

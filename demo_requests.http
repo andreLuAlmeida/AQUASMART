@@ -1,0 +1,17 @@
+### Health
+GET http://127.0.0.1:8000/health
+
+### List scenes
+GET http://127.0.0.1:8000/demo/scenes
+
+### Direct inference: first image
+POST http://127.0.0.1:8000/demo/macrophytes
+Content-Type: application/json
+
+{"image_index": 0}
+
+### Agent: first image
+POST http://127.0.0.1:8000/agent/run
+Content-Type: application/json
+
+{"message": "Analise as macrofitas da primeira imagem"}

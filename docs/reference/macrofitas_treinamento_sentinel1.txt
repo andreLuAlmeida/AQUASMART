@@ -1,0 +1,477 @@
+# =========================
+# TREINAMENTO — Sentinel-1 (VV/VH)
+# Modelos: unet2_s1 | deeplabv3+2_s1 | swin2_s1
+# Sem class weights, sem scheduler, sem AMP
+# Lendo os datasets já extraídos (apenas AOI; classes: 0 bg, 1 water, 2 plant)
+# + checkpoint seguro (detecta .pt corrompido e salva de forma atômica)
+# =========================
+import os, time, json, shutil
+from pathlib import Path
+import numpy as np
+from PIL import Image
+import torch
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from sklearn.metrics import f1_score
+
+# ====== CONFIG ======
+# Estrutura esperada (do seu extrator S1):
+#   OUTPUT_ROOT/unet_patches_128/
+#       train/<REGAP_S1_YYYYMMDD>/ {inputs(.npy 2x128x128), masks(.png 128x128)}
+#       val/  <REGAP_S1_YYYYMMDD>/ {inputs, masks}
+OUTPUT_ROOT = r"D:\0 SR REGAP\Tese_Cap2_2025\data_train_val_s1\unet_patches_128"
+
+patch_size   = 128
+batch_size   = 16
+epochs       = 300
+num_classes  = 3            # 0=fundo(ignorar), 1=water, 2=plant
+in_channels  = 2            # Sentinel-1: VV, VH
+device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+seed         = 42
+
+# Otimizador
+base_lr      = 1e-4
+
+# Treino
+ignore_index_label   = 0    # rótulo da classe de fundo
+early_stop_after     = 200  # só começa a considerar early stop depois disso
+early_stop_patience  = 50
+early_stop_min_delta = 1e-4
+
+# I/O
+fig_dir   = "figs_runs_s1"; os.makedirs(fig_dir, exist_ok=True)
+check_dir = "checkpoints_s1"; os.makedirs(check_dir, exist_ok=True)
+
+# ====== REPRODUTIBILIDADE ======
+def set_seed(s):
+    torch.manual_seed(s); np.random.seed(s)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(s)
+set_seed(seed)
+
+# ====== UTILS ======
+def fmt_time(sec):
+    m, s = divmod(int(sec), 60); h, m = divmod(m, 60)
+    return f"{h:d}h{m:02d}m{s:02d}s" if h > 0 else f"{m:02d}m{s:02d}s"
+
+def safe_show_or_save(fig, fname=None, save=True):
+    if save and fname:
+        fig.savefig(fname, bbox_inches="tight", dpi=140)
+    plt.show()
+    plt.close(fig)
+
+# ---- Checkpoint seguro ----
+def load_checkpoint_safe(path, map_location):
+    try:
+        return torch.load(path, map_location=map_location)
+    except Exception as e:
+        bad = Path(path)
+        quarantine = bad.with_suffix(bad.suffix + ".broken")
+        try:
+            bad.rename(quarantine)
+            print(f"⚠ Checkpoint corrompido movido para: {quarantine}")
+        except Exception as e2:
+            print(f"⚠ Falha ao isolar checkpoint corrompido ({bad}): {e2}")
+        return None
+
+def atomic_torch_save(obj, path):
+    tmp = str(path) + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)  # atomic swap
+
+# ====== DATA DISCOVERY ======
+def list_datasets_in_split(split_root):
+    """Retorna nomes de datasets (pastas com inputs/ e masks/) no split dado."""
+    if not os.path.isdir(split_root): return []
+    out = []
+    for name in sorted(os.listdir(split_root)):
+        in_dir = os.path.join(split_root, name, "inputs")
+        mk_dir = os.path.join(split_root, name, "masks")
+        if os.path.isdir(in_dir) and os.path.isdir(mk_dir):
+            out.append(name)
+    return out
+
+def make_concat_dataset(root, split_names):
+    """Monta um ConcatDataset a partir de vários datasets (inputs/masks) para um split (train/ ou val/)."""
+    datasets = []
+    for name in split_names:
+        in_dir = os.path.join(root, name, "inputs")
+        mk_dir = os.path.join(root, name, "masks")
+        datasets.append(PatchDataset(in_dir, mk_dir))
+    return ConcatDataset(datasets) if datasets else None
+
+# ====== DATASET ======
+class PatchDataset(Dataset):
+    def __init__(self, input_dir, mask_dir):
+        self.input_dir = input_dir
+        self.mask_dir  = mask_dir
+        self.filenames = [f[:-4] for f in os.listdir(input_dir) if f.lower().endswith(".npy")]
+
+    def __len__(self): return len(self.filenames)
+
+    def __getitem__(self, idx):
+        fname = self.filenames[idx]
+        x = np.load(os.path.join(self.input_dir, fname + ".npy")).astype(np.float32)  # [C,H,W]
+        y = np.array(Image.open(os.path.join(self.mask_dir,  fname + ".png"))).astype(np.int64)  # [H,W]
+
+        # Garantir formato esperado (2 canais, 128x128)
+        if x.shape[0] < in_channels:
+            pad = in_channels - x.shape[0]
+            x = np.concatenate([x, np.repeat(x[-1:, :, :], pad, axis=0)], axis=0)
+        elif x.shape[0] > in_channels:
+            x = x[:in_channels, :, :]
+
+        x = x[:, :patch_size, :patch_size]
+        y = y[:patch_size, :patch_size]
+
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+# ====== LOSS (Dual Focal) ======
+class DualFocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, ignore_index=None):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+
+    def forward(self, inputs, targets):
+        ce = F.cross_entropy(inputs, targets, ignore_index=self.ignore_index, reduction="none")
+        pt = torch.exp(-ce)
+        focal = self.alpha * (1 - pt) ** self.gamma * ce + (1 - self.alpha) * (pt ** self.gamma) * ce
+        if self.ignore_index is not None:
+            valid = (targets != self.ignore_index)
+            num = valid.sum().clamp_min(1)
+            return (focal * valid).sum() / num
+        return focal.mean()
+
+    @torch.no_grad()
+    def mean_over_all(self, inputs, targets):
+        ce = F.cross_entropy(inputs, targets, ignore_index=self.ignore_index, reduction="none")
+        pt = torch.exp(-ce)
+        focal = self.alpha * (1 - pt) ** self.gamma * ce + (1 - self.alpha) * (pt ** self.gamma) * ce
+        if self.ignore_index is not None:
+            focal = focal * (targets != self.ignore_index)
+        return focal.mean()
+
+# ====== MÉTRICA: Macro-F1 (sem classe 0) ======
+def macro_f1_no_bg(preds_flat, trues_flat, num_classes):
+    mask = trues_flat != ignore_index_label
+    if mask.sum() == 0:
+        return 0.0
+    preds = preds_flat[mask]
+    trues = trues_flat[mask]
+    labels = list(range(1, num_classes))  # [1,2]
+    return f1_score(trues, preds, labels=labels, average="macro", zero_division=0)
+
+# ====== BUILDERS ======
+def build_model(model_name: str, in_channels=2, num_classes=3):
+    """
+    Retorna nn.Module [B,C,H,W] -> [B,num_classes,H,W]
+    Aceita: 'unet2_s1', 'deeplabv3+2_s1', 'swin2_s1'
+    """
+    name = model_name.lower()
+    if name == "unet2_s1":
+        import segmentation_models_pytorch as smp
+        return smp.Unet(
+            encoder_name="resnet34",
+            encoder_weights=None,
+            in_channels=in_channels,
+            classes=num_classes
+        )
+    elif name == "deeplabv3+2_s1":
+        import segmentation_models_pytorch as smp
+        return smp.DeepLabV3Plus(
+            encoder_name="resnet50",
+            encoder_weights=None,
+            in_channels=in_channels,
+            classes=num_classes
+        )
+    elif name == "swin2_s1":
+        import timm
+        backbone = timm.create_model(
+            "swin_tiny_patch4_window7_224",
+            features_only=True,
+            out_indices=(0, 1, 2, 3),
+            in_chans=in_channels,
+            pretrained=False,
+            img_size=patch_size,
+            window_size=8
+        )
+        feat_channels = backbone.feature_info.channels()
+
+        class FPNDecoder(nn.Module):
+            def __init__(self, in_chs, out_ch=128, num_classes=3):
+                super().__init__()
+                C1, C2, C3, C4 = in_chs
+                self.l4 = nn.Conv2d(C4, out_ch, 1)
+                self.l3 = nn.Conv2d(C3, out_ch, 1)
+                self.l2 = nn.Conv2d(C2, out_ch, 1)
+                self.l1 = nn.Conv2d(C1, out_ch, 1)
+                self.s4 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+                self.s3 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+                self.s2 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+                self.s1 = nn.Conv2d(out_ch, out_ch, 3, padding=1)
+                self.cls = nn.Conv2d(out_ch, num_classes, 3, padding=1)
+
+            def forward(self, feats, target_size):
+                c1, c2, c3, c4 = feats
+                p4 = self.l4(c4)
+                p3 = self.l3(c3) + F.interpolate(p4, size=c3.shape[-2:], mode="bilinear", align_corners=False)
+                p2 = self.l2(c2) + F.interpolate(p3, size=c2.shape[-2:], mode="bilinear", align_corners=False)
+                p1 = self.l1(c1) + F.interpolate(p2, size=c1.shape[-2:], mode="bilinear", align_corners=False)
+                p4 = self.s4(p4); p3 = self.s3(p3); p2 = self.s2(p2); p1 = self.s1(p1)
+                logits = self.cls(p1)
+                logits = F.interpolate(logits, size=target_size, mode="bilinear", align_corners=False)
+                return logits
+
+        class TimmBackboneFPN(nn.Module):
+            def __init__(self, bb, in_chs, num_classes):
+                super().__init__()
+                self.backbone = bb
+                self.in_chs = in_chs
+                self.decoder = FPNDecoder(in_chs, out_ch=128, num_classes=num_classes)
+            def _to_nchw(self, f, c_expected):
+                if f.ndim == 4 and f.shape[1] != c_expected and f.shape[-1] == c_expected:
+                    f = f.permute(0, 3, 1, 2).contiguous()
+                return f
+            def forward(self, x):
+                feats = self.backbone(x)
+                feats = [self._to_nchw(f, c) for f, c in zip(feats, self.in_chs)]
+                return self.decoder(feats, target_size=x.shape[-2:])
+        return TimmBackboneFPN(backbone, feat_channels, num_classes)
+    else:
+        raise ValueError("Escolha: 'unet2_s1', 'deeplabv3+2_s1' ou 'swin2_s1'.")
+
+# ====== DATA LOADERS (usando split pronto do extrator) ======
+train_root = os.path.join(OUTPUT_ROOT, "train")
+val_root   = os.path.join(OUTPUT_ROOT, "val")
+train_names = list_datasets_in_split(train_root)
+val_names   = list_datasets_in_split(val_root)
+assert train_names or val_names, f"Nenhum dataset encontrado em {train_root} ou {val_root}"
+
+train_set = make_concat_dataset(train_root, train_names)
+val_set   = make_concat_dataset(val_root,   val_names)
+assert train_set is not None and val_set is not None, "Splits vazios."
+
+train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,  num_workers=0, pin_memory=True, drop_last=True)
+val_loader   = DataLoader(val_set,   batch_size=1,         shuffle=False, num_workers=0, pin_memory=True, drop_last=False)
+
+# ====== PLOTS ======
+def plot_super_epoch(model_name, history, epoch, save_dir="figs_runs_s1"):
+    tr = history["train_losses"][:epoch]
+    va = history["val_losses"][:epoch]
+    f1 = history["val_macro_f1"][:epoch]
+    gap = [va[i] - tr[i] for i in range(len(tr))]
+    x = np.arange(1, len(tr) + 1)
+
+    fig = plt.figure(figsize=(14,8))
+    ax1 = plt.subplot(2,2,1)
+    ax1.plot(x, tr, label="Train (DualFocal)")
+    ax1.plot(x, va, label="Val (DualFocal)")
+    ax1.set_title("Loss"); ax1.set_xlabel("Época"); ax1.set_ylabel("Loss")
+    ax1.grid(True); ax1.legend()
+
+    ax2 = plt.subplot(2,2,2)
+    ax2.plot(x, gap, label="Gap (Val-Train)")
+    ax2.axhline(0, linestyle="--")
+    ax2.set_title("Gap"); ax2.set_xlabel("Época"); ax2.set_ylabel("Gap")
+    ax2.grid(True); ax2.legend()
+
+    ax3 = plt.subplot(2,1,2)
+    ax3.plot(x, f1, label="Macro-F1 (no-bg)")
+    ax3.set_title("Macro-F1 (no-bg)"); ax3.set_xlabel("Época"); ax3.set_ylabel("Macro-F1")
+    ax3.grid(True); ax3.legend()
+
+    plt.suptitle(f"Super-plot - {model_name} (até época {epoch})", y=0.98)
+    plt.tight_layout(rect=[0,0,1,0.96])
+    safe_show_or_save(fig, os.path.join(save_dir, f"{model_name}_superplot_ep{epoch:03d}.png"))
+
+def plot_history(model_name, history):
+    plot_super_epoch(model_name, history, epoch=len(history["train_losses"]), save_dir=fig_dir)
+
+# ====== LOOP DE TREINO DE UM MODELO ======
+def train_one_model(model_name, train_loader, val_loader):
+    print(f"\n==========================")
+    print(f"Treinando modelo: {model_name}")
+    print(f"==========================\n")
+
+    set_seed(seed)
+    model = build_model(model_name, in_channels=in_channels, num_classes=num_classes).to(device)
+    criterion = DualFocalLoss(alpha=0.25, gamma=2.0, ignore_index=ignore_index_label)
+    optimizer = optim.Adam(model.parameters(), lr=base_lr)
+
+    train_losses, val_losses, val_ce_losses, val_macro_f1 = [], [], [], []
+    tag = model_name
+    ckpt_path = os.path.join(check_dir, f"checkpoint_{tag}_S1.pt")
+    best_path = os.path.join(check_dir, f"model_best_{tag}_S1.pt")
+    best_macro_f1 = -np.inf
+    start_epoch = 1
+    epochs_no_improve = 0
+
+    # (Opcional) Retomar de checkpoint se existir (modo seguro)
+    if os.path.exists(ckpt_path):
+        ckpt = load_checkpoint_safe(ckpt_path, map_location=device)
+        if ckpt is not None:
+            try:
+                model.load_state_dict(ckpt["model_state_dict"])
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                for state in optimizer.state.values():
+                    for k, v in list(state.items()):
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.to(device)
+                for pg in optimizer.param_groups:
+                    pg["lr"] = base_lr  # garante LR
+                start_epoch   = ckpt.get("epoch", 0) + 1
+                best_macro_f1 = ckpt.get("best_macro_f1", -np.inf)
+                hist          = ckpt.get("history", {})
+                train_losses  = list(hist.get("train_losses", []))
+                val_losses    = list(hist.get("val_losses", []))
+                val_ce_losses = list(hist.get("val_ce_losses", []))
+                val_macro_f1  = list(hist.get("val_macro_f1", []))
+                print(f"🔄 Retomando {model_name} da época {start_epoch} (best macro-F1 = {best_macro_f1:.4f})")
+            except Exception as e:
+                print(f"⚠ Não foi possível aplicar checkpoint (incompatível/corrompido): {e}")
+                print("→ Treinando do zero.")
+                start_epoch   = 1
+                best_macro_f1 = -np.inf
+
+    t0_model = time.perf_counter()
+    for ep in range(start_epoch, epochs + 1):
+        ep_start = time.perf_counter()
+        # === TREINO ===
+        model.train()
+        running = 0.0
+        n_batches = 0
+
+        for xb, yb in tqdm(train_loader, desc=f"{model_name} Ep {ep}/{epochs}"):
+            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            out = model(xb)
+            loss = criterion(out, yb)
+            loss.backward()
+            optimizer.step()
+
+            running += float(loss.item())
+            n_batches += 1
+
+        train_loss = running / max(1, n_batches)
+        train_losses.append(train_loss)
+
+        # === VALIDAÇÃO ===
+        model.eval()
+        val_running = 0.0
+        val_ce_running = 0.0
+        preds_all, trues_all = [], []
+
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
+                out = model(xb)
+
+                vloss_focal = criterion.mean_over_all(out, yb).item()
+                ce_map = F.cross_entropy(out, yb, ignore_index=ignore_index_label, reduction="none")
+                ce_map = ce_map * (yb != ignore_index_label)
+                vloss_ce = ce_map.mean().item()
+
+                val_running += vloss_focal
+                val_ce_running += vloss_ce
+
+                preds_all.append(out.argmax(1).cpu().numpy())
+                trues_all.append(yb.cpu().numpy())
+
+        val_loss = val_running / max(1, len(val_loader))
+        val_losses.append(val_loss)
+        val_ce_loss = val_ce_running / max(1, len(val_loader))
+        val_ce_losses.append(val_ce_loss)
+
+        preds_flat = np.concatenate([p.flatten() for p in preds_all]) if preds_all else np.array([], dtype=np.int64)
+        trues_flat = np.concatenate([t.flatten() for t in trues_all]) if trues_all else np.array([], dtype=np.int64)
+        mF1 = macro_f1_no_bg(preds_flat, trues_flat, num_classes)
+        val_macro_f1.append(mF1)
+
+        ep_time = time.perf_counter() - ep_start
+        print(
+            f"[{model_name}] Ep {ep:03d}/{epochs} | "
+            f"Train {train_loss:.4f} | ValFocal {val_loss:.4f} | ValCE {val_ce_loss:.4f} | "
+            f"Macro-F1(no-bg) {mF1:.4f} | {fmt_time(ep_time)}"
+        )
+
+        # Super-plot periódico
+        if (ep % 3) == 0:
+            plot_super_epoch(
+                model_name,
+                {"train_losses": train_losses, "val_losses": val_losses, "val_macro_f1": val_macro_f1},
+                epoch=ep,
+                save_dir=fig_dir
+            )
+
+        # Melhor por Macro-F1 + Early Stop
+        if mF1 > best_macro_f1 + early_stop_min_delta:
+            best_macro_f1 = mF1
+            epochs_no_improve = 0
+            atomic_torch_save(model.state_dict(), best_path)
+        else:
+            epochs_no_improve += 1
+
+        # Salva checkpoint completo (atômico)
+        atomic_torch_save({
+            "epoch": ep,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_macro_f1": best_macro_f1,
+            "history": {
+                "train_losses": train_losses,
+                "val_losses":   val_losses,
+                "val_ce_losses": val_ce_losses,
+                "val_macro_f1": val_macro_f1,
+            }
+        }, ckpt_path)
+
+        # Early stop
+        if ep >= early_stop_after and epochs_no_improve >= early_stop_patience:
+            print(f"⛔ Early stopping em Ep {ep}: sem melhora > {early_stop_min_delta} "
+                  f"por {early_stop_patience} épocas (após Ep {early_stop_after}).")
+            break
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    total_time = time.perf_counter() - t0_model
+    best_ep = int(np.argmax(val_macro_f1)) + 1 if len(val_macro_f1) else 0
+    print(
+        f"\n>>> {model_name}: melhor Macro-F1 (no-bg) = {np.max(val_macro_f1):.4f} @ época {best_ep} "
+        f"| Tempo total: {fmt_time(total_time)}\n"
+    )
+    history = {
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_ce_losses": val_ce_losses,
+        "val_macro_f1": val_macro_f1
+    }
+    plot_history(model_name, history)
+    return history
+
+# ====== EXECUÇÃO ======
+model_list = ["unet2_s1", "deeplabv3+2_s1", "swin2_s1"]
+results = {}
+
+global_start = time.perf_counter()
+for name in model_list:
+    results[name] = train_one_model(name, train_loader, val_loader)
+global_time = time.perf_counter() - global_start
+print(f"\n=== Tempo total (todos os modelos): {fmt_time(global_time)} ===")
+
+# ====== COMPARAÇÃO FINAL ======
+try:
+    fig = plt.figure(figsize=(7,4))
+    best_macro = [np.max(results[n]["val_macro_f1"]) if len(results[n]["val_macro_f1"]) else 0 for n in results]
+    plt.bar(list(results.keys()), best_macro)
+    plt.title("Melhor Macro-F1 (sem fundo) por modelo — Sentinel-1 (VV/VH)")
+    plt.ylabel("Macro-F1"); plt.grid(True, axis='y'); plt.tight_layout()
+    safe_show_or_save(fig, os.path.join(fig_dir, "comparacao_best_macro_f1_s1.png"))
+except Exception as e:
+    print(f"(Plot final ignorado: {e})")
